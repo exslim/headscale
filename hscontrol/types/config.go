@@ -33,12 +33,13 @@ const (
 )
 
 var (
-	errOidcMutuallyExclusive     = errors.New("oidc_client_secret and oidc_client_secret_path are mutually exclusive")
-	errServerURLSuffix           = errors.New("server_url cannot be part of base_domain in a way that could make the DERP and headscale server unreachable")
-	errServerURLSame             = errors.New("server_url cannot use the same domain as base_domain in a way that could make the DERP and headscale server unreachable")
-	errInvalidPKCEMethod         = errors.New("pkce.method must be either 'plain' or 'S256'")
-	ErrNoPrefixConfigured        = errors.New("no IPv4 or IPv6 prefix configured, minimum one prefix is required")
-	ErrInvalidAllocationStrategy = errors.New("invalid prefix allocation strategy")
+	errOidcMutuallyExclusive         = errors.New("oidc_client_secret and oidc_client_secret_path are mutually exclusive")
+	errCloudflareChallengeIncomplete = errors.New("dns.challenge.cloudflare.api_token and dns.challenge.cloudflare.zone must either both be set or both be empty")
+	errServerURLSuffix               = errors.New("server_url cannot be part of base_domain in a way that could make the DERP and headscale server unreachable")
+	errServerURLSame                 = errors.New("server_url cannot use the same domain as base_domain in a way that could make the DERP and headscale server unreachable")
+	errInvalidPKCEMethod             = errors.New("pkce.method must be either 'plain' or 'S256'")
+	ErrNoPrefixConfigured            = errors.New("no IPv4 or IPv6 prefix configured, minimum one prefix is required")
+	ErrInvalidAllocationStrategy     = errors.New("invalid prefix allocation strategy")
 )
 
 type IPAllocationStrategy string
@@ -89,6 +90,8 @@ type Config struct {
 	// it can be used directly when sending Netmaps to clients.
 	TailcfgDNSConfig *tailcfg.DNSConfig
 
+	DNSChallenge DNSChallengeConfig
+
 	UnixSocket           string
 	UnixSocketPermission fs.FileMode
 
@@ -118,6 +121,19 @@ type DNSConfig struct {
 type Nameservers struct {
 	Global []string
 	Split  map[string][]string
+}
+
+type DNSChallengeConfig struct {
+	Cloudflare CloudflareDNSChallengeConfig
+}
+
+type CloudflareDNSChallengeConfig struct {
+	APIToken string
+	Zone     string
+}
+
+func (c CloudflareDNSChallengeConfig) Enabled() bool {
+	return strings.TrimSpace(c.APIToken) != "" && strings.TrimSpace(c.Zone) != ""
 }
 
 type SqliteConfig struct {
@@ -459,6 +475,11 @@ func validateServerConfig() error {
 		log.Fatal().Msg("fatal config error: dns.extra_records and dns.extra_records_path are mutually exclusive. Please remove one of them from your config file")
 	}
 
+	dnsChallengeConfig, err := dnsChallengeConfigFromFile()
+	if err != nil {
+		return err
+	}
+
 	// Collect any validation errors and return them all at once
 	var errorText string
 	if (viper.GetString("tls_letsencrypt_hostname") != "") &&
@@ -505,6 +526,12 @@ func validateServerConfig() error {
 		}
 	}
 
+	if !dnsChallengeConfig.Cloudflare.Enabled() &&
+		(strings.TrimSpace(dnsChallengeConfig.Cloudflare.APIToken) != "" ||
+			strings.TrimSpace(dnsChallengeConfig.Cloudflare.Zone) != "") {
+		return errCloudflareChallengeIncomplete
+	}
+
 	// Validate tuning parameters
 	if size := viper.GetInt("tuning.node_store_batch_size"); size <= 0 {
 		errorText += fmt.Sprintf(
@@ -545,6 +572,27 @@ func tlsConfig() TLSConfig {
 			viper.GetString("tls_key_path"),
 		),
 	}
+}
+
+func dnsChallengeConfigFromFile() (DNSChallengeConfig, error) {
+	configFile := viper.ConfigFileUsed()
+	if configFile == "" {
+		return DNSChallengeConfig{}, nil
+	}
+
+	fileViper := viper.New()
+	fileViper.SetConfigFile(configFile)
+
+	if err := fileViper.ReadInConfig(); err != nil {
+		return DNSChallengeConfig{}, fmt.Errorf("reading config file for dns challenge settings: %w", err)
+	}
+
+	return DNSChallengeConfig{
+		Cloudflare: CloudflareDNSChallengeConfig{
+			APIToken: strings.TrimSpace(fileViper.GetString("dns.challenge.cloudflare.api_token")),
+			Zone:     strings.TrimSpace(fileViper.GetString("dns.challenge.cloudflare.zone")),
+		},
+	}, nil
 }
 
 func derpConfig() DERPConfig {
@@ -998,6 +1046,11 @@ func LoadServerConfig() (*Config, error) {
 		return nil, err
 	}
 
+	dnsChallengeConfig, err := dnsChallengeConfigFromFile()
+	if err != nil {
+		return nil, err
+	}
+
 	derpConfig := derpConfig()
 	logTailConfig := logtailConfig()
 	randomizeClientPort := viper.GetBool("randomize_client_port")
@@ -1063,6 +1116,7 @@ func LoadServerConfig() (*Config, error) {
 
 		DNSConfig:        dnsConfig,
 		TailcfgDNSConfig: dnsToTailcfgDNS(dnsConfig),
+		DNSChallenge:     dnsChallengeConfig,
 
 		ACMEEmail: viper.GetString("acme_email"),
 		ACMEURL:   viper.GetString("acme_url"),

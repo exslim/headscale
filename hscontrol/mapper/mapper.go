@@ -124,6 +124,10 @@ func generateDNSConfig(
 
 	dnsConfig := cfg.TailcfgDNSConfig.Clone()
 
+	if certDomain, err := node.GetFQDN(cfg.BaseDomain); err == nil {
+		dnsConfig.CertDomains = []string{strings.TrimSuffix(certDomain, ".")}
+	}
+
 	addNextDNSMetadata(dnsConfig.Resolvers, node)
 
 	return dnsConfig
